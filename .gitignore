@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.sqlite3
+*.log
+log.txt
+tests/.testdata/
+tests/.testdata-tools/
+tests/.testdata-agent/
+tests/.testdata-natural/
+tests/.testdata-stream/
+tests/.testdata-web/
+tests/.testdata-code/

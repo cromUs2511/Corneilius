@@ -1,0 +1,3 @@
+# Desktop interfaces (free, open-source). Only the one you launch is loaded.
+customtkinter>=5.2
+PySide6>=6.0

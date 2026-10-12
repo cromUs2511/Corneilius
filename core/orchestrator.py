@@ -28,6 +28,8 @@ from jarvis.core.natural import (
 )
 from jarvis.memory.database import ConversationStore
 from jarvis.memory.long_term import LongTermMemory
+from jarvis.memory.skills import SkillStore
+from jarvis.memory.tasks import TaskRunStore
 from jarvis.models.base import ModelAdapter
 from jarvis.tools.audit import ToolAuditLog
 from jarvis.tools.registry import ToolRegistry, build_default_registry
@@ -48,11 +50,16 @@ class Orchestrator:
         self.model = model
         self.memory = memory
         self.long_term = LongTermMemory(memory.path)
+        self.tasks = TaskRunStore(memory.path)
+        self.skills = SkillStore(memory.path)
         self._pending: dict[str, Any] | None = None
         self._pending_agent: dict[str, Any] | None = None
         self._agent_cancel = threading.Event()
         self._last_final = ""
         self._last_replaced = False
+        self._last_task_id: int | None = None
+        self._last_steps: list[AgentStep] = []
+        self._last_goal = ""
         # Optional live-progress hook (used by the desktop UI to show each step).
         # Called from a worker thread; implementations must be thread-safe.
         self.on_progress: Any = None
@@ -117,6 +124,10 @@ class Orchestrator:
             answer = self._tool_command(cleaned)
         if answer is None:
             answer = self._agent_command(cleaned)
+        if answer is None:
+            answer = self._task_command(cleaned)
+        if answer is None:
+            answer = self._skill_command(cleaned)
         if answer is None:
             answer = self._pending_answer(cleaned)
         if answer is None:
@@ -298,6 +309,7 @@ class Orchestrator:
                     resume_confirmed={"name": str(pending["step"]["tool"]), "args": dict(pending["step"]["args"])},
                     allow_web=bool(pending.get("allow_web", False)),
                     verbose=bool(pending.get("verbose", False)),
+                    task_id=pending.get("task_id"),
                 )
             if self._pending is None:
                 return "Nothing is waiting for confirmation."
@@ -312,6 +324,12 @@ class Orchestrator:
             cancelled_something = False
             self._agent_cancel.set()
             if self._pending_agent is not None:
+                dropped_task = self._pending_agent.get("task_id")
+                if dropped_task is not None:
+                    try:
+                        self.tasks.finish(int(dropped_task), "cancelled", [], "Dropped while paused.")
+                    except Exception:
+                        logger.warning("Could not mark task cancelled", exc_info=True)
                 self._pending_agent = None
                 cancelled_something = True
             if self._pending is not None:
@@ -356,8 +374,15 @@ class Orchestrator:
                 resume_confirmed={"name": str(pending["step"]["tool"]), "args": dict(pending["step"]["args"])},
                 allow_web=bool(pending.get("allow_web", False)),
                 verbose=bool(pending.get("verbose", False)),
+                task_id=pending.get("task_id"),
             )
         if is_negative(message):
+            dropped_task = self._pending_agent.get("task_id")
+            if dropped_task is not None:
+                try:
+                    self.tasks.finish(int(dropped_task), "cancelled", [], "Dropped while paused.")
+                except Exception:
+                    logger.warning("Could not mark task cancelled", exc_info=True)
             self._pending_agent = None
             return "Okay, I dropped that request. Nothing was changed."
         return None
@@ -450,6 +475,141 @@ class Orchestrator:
             self._pending_agent = None
         return self._agent_run(argument, allow_write, allow_web=allow_web, verbose=verbose)
 
+    # -- Day 3: persistent tasks -------------------------------------------------
+
+    @staticmethod
+    def _step_to_dict(step: AgentStep) -> dict[str, Any]:
+        return {
+            "index": step.index, "tool": step.tool, "args": step.args,
+            "status": step.status, "output": step.output, "error": step.error,
+            "attempts": step.attempts, "verified": step.verified, "note": step.note,
+        }
+
+    @staticmethod
+    def _dict_to_step(data: dict[str, Any]) -> AgentStep:
+        args = data.get("args", {})
+        return AgentStep(
+            index=int(data.get("index", 0)),
+            tool=str(data.get("tool", "")),
+            args=dict(args) if isinstance(args, dict) else {},
+            status=str(data.get("status", "pending")),
+            output=str(data.get("output", "")),
+            error=str(data.get("error", "")),
+            attempts=int(data.get("attempts", 0)),
+            verified=bool(data.get("verified", False)),
+            note=str(data.get("note", "")),
+        )
+
+    def _task_command(self, message: str) -> str | None:
+        command, _, argument = message.partition(" ")
+        command = command.casefold()
+        argument = argument.strip()
+        if command == "/tasks":
+            limit = 10
+            if argument:
+                try:
+                    limit = int(argument)
+                except ValueError as exc:
+                    raise ValueError("Usage: /tasks [limit]") from exc
+            rows = self.tasks.list_recent(limit)
+            if not rows:
+                return "No agent tasks recorded yet."
+            lines = [
+                f"#{row['id']} [{row['status']}] {(row['goal'] or '')[:80]} ({row['updated_at']})"
+                for row in rows
+            ]
+            return "Recent agent tasks:\n" + "\n".join(lines)
+        if command == "/resume":
+            try:
+                resume_id = int(argument)
+            except ValueError as exc:
+                raise ValueError("Usage: /resume <task ID>") from exc
+            saved = self.tasks.load_resumable(resume_id)
+            if saved is None:
+                return f"Task #{resume_id} is not resumable (missing, finished, or cancelled)."
+            steps = [self._dict_to_step(d) for d in saved.get("steps", []) if isinstance(d, dict)]
+            pending = saved.get("pending", {})
+            if not isinstance(pending, dict) or not pending.get("tool"):
+                return f"Task #{resume_id} has no pending approval to resume."
+            flags = saved.get("flags", {})
+            self._pending_agent = {
+                "goal": str(saved.get("goal", "")),
+                "allow_write": bool(flags.get("allow_write", False)),
+                "allow_web": bool(flags.get("allow_web", False)),
+                "verbose": bool(flags.get("verbose", False)),
+                "steps": steps,
+                "step": {"tool": str(pending["tool"]), "args": dict(pending.get("args", {}))},
+                "task_id": resume_id,
+            }
+            return (
+                f"Resumed task #{resume_id} ('{str(saved.get('goal', ''))[:80]}'). "
+                f"Step {len(steps) + 1} wants to run '{pending['tool']}', which needs approval. "
+                "Reply yes to allow this step and continue, or no to drop the run."
+            )
+        return None
+
+    def _skill_command(self, message: str) -> str | None:
+        command, _, argument = message.partition(" ")
+        command = command.casefold()
+        argument = argument.strip()
+        if command == "/skills":
+            skills = self.skills.list_skills()
+            if not skills:
+                return "No saved skills yet. Use /skill save <name> after a successful task."
+            lines = [
+                f"{s['name']} v{s['version']} [{s['status']}]"
+                + (f" (from task #{s['source_task_id']})" if s["source_task_id"] else "")
+                for s in skills
+            ]
+            return "Saved skills:\n" + "\n".join(lines)
+        if command == "/skill":
+            sub, _, rest = argument.partition(" ")
+            sub = sub.casefold()
+            rest = rest.strip()
+            if sub == "save":
+                return self._skill_save(rest)
+            if sub == "test":
+                if not rest:
+                    raise ValueError("Usage: /skill test <name>")
+                skill = self.skills.get_latest(rest)
+                if skill is None:
+                    return f"No skill named '{rest}'."
+                error = SkillStore.validate_workflow(skill["workflow"], self.tools)
+                if error is not None:
+                    return f"Skill '{rest}' v{skill['version']} failed validation: {error}"
+                self.skills.mark_tested(rest, int(skill["version"]))
+                return f"Skill '{rest}' v{skill['version']} passed validation and is marked tested."
+            if sub == "enable":
+                if not rest:
+                    raise ValueError("Usage: /skill enable <name>")
+                try:
+                    self.skills.enable(rest)
+                except (KeyError, ValueError) as exc:
+                    return str(exc)
+                skill = self.skills.get_latest(rest)
+                return f"Skill '{rest}' v{skill['version']} is now enabled."
+            raise ValueError("Usage: /skill save <name> | /skill test <name> | /skill enable <name>")
+        return None
+
+    def _skill_save(self, name: str) -> str:
+        if not name:
+            raise ValueError("Usage: /skill save <name>")
+        steps = [s for s in self._last_steps if s.status == "ok"]
+        if not steps:
+            return "No successful steps in the last task to save as a skill."
+        workflow = [{"tool": s.tool, "args": s.args} for s in steps]
+        error = SkillStore.validate_workflow(workflow, self.tools)
+        if error is not None:
+            return f"Last task cannot become a skill: {error}"
+        _, version = self.skills.save_draft(
+            name, workflow, source_task_id=self._last_task_id,
+            note=f"Captured from task #{self._last_task_id}: {self._last_goal[:120]}",
+        )
+        return (
+            f"Saved skill '{name}' v{version} as a draft ({len(workflow)} step(s), from task "
+            f"#{self._last_task_id}). Test it with /skill test {name} before enabling."
+        )
+
     def _agent_run(
         self,
         goal: str,
@@ -459,9 +619,15 @@ class Orchestrator:
         first_reply: str | None = None,
         allow_web: bool = False,
         verbose: bool = False,
+        task_id: int | None = None,
     ) -> str:
         started = time.monotonic()
         steps: list[AgentStep] = list(resume_steps or [])
+        flags = {"allow_write": allow_write, "allow_web": allow_web, "verbose": verbose}
+        if task_id is None:
+            task_id = self.tasks.create(goal, flags)
+        self._last_task_id = task_id
+        self._last_goal = goal
         relevant = self.long_term.retrieve_relevant(goal)
         memories = [f"[{entry['category']}] {entry['content']}" for entry in relevant]
         system = build_agent_system(goal, [spec.usage() for spec in self.tools.specs()], memories)
@@ -546,12 +712,20 @@ class Orchestrator:
                     "verbose": verbose,
                     "steps": steps,
                     "step": {"tool": name, "args": args},
+                    "task_id": task_id,
                 }
+                self.tasks.save_pause(
+                    task_id,
+                    [self._step_to_dict(s) for s in steps],
+                    {"tool": name, "args": args},
+                    flags,
+                )
+                self._last_steps = list(steps)
                 partial = summarize(steps, "Waiting for confirmation.", "paused for confirmation", elapsed())
                 return (
                     partial
                     + f"\n\nStep {step.index} wants to run '{name}', which needs approval. "
-                    "Reply yes to allow this step and continue, or no to drop the run."
+                    f"Reply yes to allow this step and continue, or no to drop the run. (task #{task_id})"
                 )
             if probe.confirmation_required or (not probe.ok and "timed out" in probe.error):
                 # Pre-approved just now, or a transient timeout worth one retry.
@@ -571,6 +745,23 @@ class Orchestrator:
 
         self._agent_cancel.clear()
         self._report_progress("Agent ready.")
+        self._last_steps = list(steps)
+        status_map = {
+            "finished": "finished" if not any(s.status == "failed" for s in steps) else "finished",
+            "cancelled": "cancelled",
+            "task timeout": "timeout",
+            "model error": "model-error",
+            "max iterations": "max-iterations",
+        }
+        try:
+            self.tasks.finish(
+                task_id,
+                status_map.get(reason, "finished"),
+                [self._step_to_dict(s) for s in steps],
+                final,
+            )
+        except Exception:
+            logger.warning("Could not persist task run", exc_info=True)
         return summarize(steps, final, reason, elapsed(), verbose)
 
     @staticmethod

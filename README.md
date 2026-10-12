@@ -150,3 +150,24 @@ Cornerlius does not retrain model weights — on 4 GB VRAM that is not realistic
 ```
 
 The preference above is injected into the agent's instructions, so the run follows it. Correct it anytime with `/memory edit`, remove it with `/forget`, and inspect what ran with `/audit`. While an agent run is paused for confirmation you can keep chatting normally, then `/confirm` to resume or `/cancel` to abort.
+
+## Persistent tasks and reusable skills (Day 3)
+
+Every agent run is recorded in SQLite (`task_runs`), so a paused or interrupted task survives restarts:
+
+```text
+/agent --allow-write Summarise notes/todo.txt into notes/summary.txt
+/tasks
+/resume 3
+```
+
+Successful runs can become versioned skills. A skill is saved as a draft, must pass validation before it can be enabled, and is never executed automatically:
+
+```text
+/skill save summarise-notes
+/skills
+/skill test summarise-notes
+/skill enable summarise-notes
+```
+
+Memory edits are logged as corrections (`memory_corrections`) so later improvements can prefer corrected content. Skill execution, PC automation (screenshots/OCR/input), and a central permission manager remain future work.

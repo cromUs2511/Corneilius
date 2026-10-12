@@ -112,6 +112,21 @@ class LongTermMemory:
         if category is not None:
             self._validate_category(category)
         with self._connect() as db:
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS memory_corrections (
+                    id INTEGER PRIMARY KEY,
+                    entry_id INTEGER NOT NULL,
+                    old_content TEXT NOT NULL DEFAULT '',
+                    new_content TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            row = db.execute(
+                "SELECT content FROM long_term_memory WHERE id = ?", (entry_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No saved memory with ID {entry_id}.")
+            old_content = str(row["content"])
             if category is None:
                 cursor = db.execute(
                     "UPDATE long_term_memory SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -124,6 +139,12 @@ class LongTermMemory:
                 )
             if cursor.rowcount == 0:
                 raise KeyError(f"No saved memory with ID {entry_id}.")
+            if old_content != content:
+                db.execute(
+                    "INSERT INTO memory_corrections(entry_id, old_content, new_content)"
+                    " VALUES (?, ?, ?)",
+                    (entry_id, old_content[:2000], content[:2000]),
+                )
 
     def delete(self, entry_id: int) -> bool:
         with self._connect() as db:

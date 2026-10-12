@@ -114,10 +114,14 @@ class CodeToolTests(unittest.TestCase):
             "Fixed greet and tests pass.",
         ])
         store = ConversationStore(self.db_path)
-        assistant = Orchestrator(MockModel(), store)
+        assistant = Orchestrator(model, store)
         assistant.tools = build_default_registry(ToolAuditLog(self.db_path), self.workspace, 30.0)
         paused = assistant.submit("/agent --allow-write fix greet")
         self.assertIn("yes", paused.lower())  # repo.test always needs explicit approval
+        # repo.test pauses on every run (it executes repo code), so the
+        # test->edit->test script needs two approvals: one per test run.
+        mid = assistant.submit("yes")
+        self.assertIn("yes", mid.lower())
         answer = assistant.submit("yes")
         self.assertIn("tests pass", answer)
         self.assertIn("return 'hello'", (self.workspace / "pkg" / "mod.py").read_text(encoding="utf-8"))
@@ -145,9 +149,17 @@ class CodeToolTests(unittest.TestCase):
         self.assertIn("a.txt", diff.output)
 
     def test_git_tools_report_non_repos(self) -> None:
-        status = self.registry.execute("repo.git_status", {"path": "pkg"})
-        self.assertFalse(status.ok)
-        self.assertIn("Not a git repository", status.error)
+        import tempfile
+
+        # The checkout itself is a git repo, and git walks upward, so a path
+        # inside the workspace would report the parent repo. Use an isolated
+        # directory outside the repo to test the true non-repo behavior.
+        with tempfile.TemporaryDirectory() as isolated:
+            isolated_db = Path(isolated) / "iso.sqlite3"
+            registry = build_default_registry(ToolAuditLog(isolated_db), Path(isolated), 30.0)
+            status = registry.execute("repo.git_status", {"path": "."})
+            self.assertFalse(status.ok)
+            self.assertIn("Not a git repository", status.error)
 
     def test_no_destructive_git_tools_exist(self) -> None:
         names = [spec.name for spec in self.registry.specs()]

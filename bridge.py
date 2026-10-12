@@ -136,6 +136,11 @@ class Bridge:
         if method == "audit.recent":
             limit = max(1, min(int(params.get("limit", 20)), 100))
             return {"entries": ToolAuditLog(self.memory.path).recent(limit)}
+        if method == "tasks.list":
+            limit = max(1, min(int(params.get("limit", 10)), 100))
+            return {"tasks": self.orchestrator.tasks.list_recent(limit)}
+        if method == "skills.list":
+            return {"skills": self.orchestrator.skills.list_skills()}
         raise ValueError(f"Unknown method: {method}.")
 
     def _dispatch(self, line: str) -> None:
